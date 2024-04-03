@@ -208,6 +208,27 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1, center
 
     return results
 
+def get_ray_directions(
+    W, H, fx, fy, cx, cy, use_pixel_centers=True, openGL_camera=True
+):
+    pixel_center = 0.5 if use_pixel_centers else 0
+    i, j = np.meshgrid(
+        np.arange(W, dtype=np.float32) + pixel_center,
+        np.arange(H, dtype=np.float32) + pixel_center,
+        indexing="xy",
+    )
+    i, j = torch.from_numpy(i), torch.from_numpy(j)
+
+    directions = torch.stack(
+        [
+            (i - cx) / fx,
+            -(j - cy) / fy,
+            -torch.ones_like(i) if openGL_camera else torch.ones_like(i),
+        ],
+        -1,
+    )  # (H, W, 3)
+
+    return directions
 
 def seed_everything(seed):
     random.seed(seed)
@@ -1348,7 +1369,6 @@ class Trainer(object):
                         return
                     else:
                         preds, preds_depth, preds_normal, truths, loss, visual_items = self.eval_step(data, env_rot_radian=env_rot_radian)
-
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
@@ -1583,9 +1603,9 @@ class Trainer(object):
             print(f"loading env from: {self.opt.swap_env_path}")
             state_dict = torch.load(self.opt.swap_env_path, map_location=self.device)
             env_state = state_dict['model']
-            net_prefix = 'env_net.'
-            env_state = {k: v for k, v in env_state.items() if k.startswith(net_prefix)}
-            env_keys = [k for k in checkpoint_dict['model'].keys() if k.startswith(net_prefix)]
+            net_prefix = 'env_net'
+            env_state = { net_prefix + '.' + k[len(net_prefix):] : v for k, v in env_state.items() if k.startswith(net_prefix)}
+            env_keys = [k for k in checkpoint_dict['model'].keys() if k.startswith(net_prefix + '.')]
             for k in env_keys:
                 if self.opt.split_diffuse_env:
                     checkpoint_dict['model']['diffuse_'+k] = checkpoint_dict['model'][k]

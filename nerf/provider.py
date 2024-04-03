@@ -6,6 +6,10 @@ from cv2 import transform
 import tqdm
 import numpy as np
 from scipy.spatial.transform import Slerp, Rotation
+from PIL import Image
+import math 
+from pathlib import Path
+import torchvision.transforms.functional as TF
 
 import trimesh
 
@@ -157,6 +161,8 @@ class NeRFDataset:
         # auto-detect transforms.json and split mode.
         if os.path.exists(os.path.join(self.root_path, 'transforms.json')):
             self.mode = 'colmap' # manually split, use view-interpolation for test.
+        elif os.path.exists(os.path.join(self.root_path, f"{self.type}_000/metadata.json")):
+            self.mode = 'tensoir'
         elif os.path.exists(os.path.join(self.root_path, 'transforms_train.json')):
             self.mode = 'blender' # provided split
         else:
@@ -189,7 +195,11 @@ class NeRFDataset:
             else:
                 with open(os.path.join(self.root_path, f'transforms_{type}.json'), 'r') as f:
                     transform = json.load(f)
-
+        elif self.mode == 'tensoir':
+            with open(
+                os.path.join(self.root_path, f"{self.type}_000/metadata.json"), "r"
+            ) as f:
+                transform = json.load(f)
         else:
             raise NotImplementedError(f'unknown dataset mode: {self.mode}')
 
@@ -199,10 +209,12 @@ class NeRFDataset:
             self.W = int(transform['w']) // downscale
         else:
             # we have to actually read an image to get H and W later.
-            self.H = self.W = None
+            self.H = self.W = 800
         
+        self.img_wh = (self.W, self.H)
         # read images
-        frames = transform["frames"]
+        if self.mode != 'tensoir':
+            frames = transform["frames"]
         #frames = sorted(frames, key=lambda d: d['file_path']) # why do I sort...
         
         # for colmap, manually interpolate a test set.
@@ -223,7 +235,29 @@ class NeRFDataset:
                 pose[:3, :3] = slerp(ratio).as_matrix()
                 pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
                 self.poses.append(pose)
-
+        elif self.mode == 'tensoir':
+            self.poses = []
+            self.images = []
+            self.root_dir = Path(self.root_path)
+            self.split_list = [x for x in self.root_dir.iterdir() if x.stem.startswith(self.type)]
+            self.split_list.sort()
+            for idx in tqdm.tqdm(range(len(self.split_list))):
+                item_path = self.split_list[idx]
+                item_meta_path = item_path / 'metadata.json'
+                with open(item_meta_path, 'r') as f:
+                    meta = json.load(f)
+                pose = np.array(list(map(float, meta["cam_transform_mat"].split(','))), dtype=np.float32).reshape(4, 4)
+                pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
+                
+                # self.all_c2w.append(c2w)
+                img_path = item_path / f'rgba.png'
+                
+                image = Image.open(img_path)
+                image = image.resize(self.img_wh, Image.BICUBIC)
+                image = np.asarray(image) / 255
+                self.poses.append(pose)
+                self.images.append(image)
+            
         else:
             # for colmap, manually split a valid set (the first frame).
             if self.mode == 'colmap':
@@ -308,6 +342,12 @@ class NeRFDataset:
             fl_y = self.H / (2 * np.tan(transform['camera_angle_y'] / 2)) if 'camera_angle_y' in transform else None
             if fl_x is None: fl_x = fl_y
             if fl_y is None: fl_y = fl_x
+        elif 'cam_angle_x' in transform:
+            # blender, assert in radians. already downscaled since we use H/W
+            fl_y = fl_x = self.W / (2 * np.tan(transform['cam_angle_x'] / 2)) if 'cam_angle_x' in transform else None
+            # fl_y = self.H / (2 * np.tan(transform['camera_angle_y'] / 2)) if 'camera_angle_y' in transform else None
+            # if fl_x is None: fl_x = fl_y
+            # if fl_y is None: fl_y = fl_x
         elif 'camera_intrinsics' in transform:
             intrinsics = np.array(transform['camera_intrinsics'], dtype=np.float32)
             fl_x = intrinsics[0, 0] / downscale
